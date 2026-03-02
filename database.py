@@ -1,6 +1,42 @@
 import aiosqlite
+import random
+import string
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict
+
+# ── УРОВНИ ────────────────────────────────────────────────────────────────────
+LEVELS = [
+    {'level': 1,  'min_spent': 500,   'name': '🛍 Покупатель I',   'discount': 3},
+    {'level': 2,  'min_spent': 1500,  'name': '🛍 Покупатель II',  'discount': 4},
+    {'level': 3,  'min_spent': 3000,  'name': '🛍 Покупатель III', 'discount': 5},
+    {'level': 4,  'min_spent': 5000,  'name': '🔥 Заядлый I',      'discount': 6},
+    {'level': 5,  'min_spent': 8000,  'name': '🔥 Заядлый II',     'discount': 7},
+    {'level': 6,  'min_spent': 12000, 'name': '🔥 Заядлый III',    'discount': 8},
+    {'level': 7,  'min_spent': 18000, 'name': '👑 Постоялец I',    'discount': 9},
+    {'level': 8,  'min_spent': 25000, 'name': '👑 Постоялец II',   'discount': 10},
+    {'level': 9,  'min_spent': 35000, 'name': '👑 Постоялец III',  'discount': 12},
+    {'level': 10, 'min_spent': 50000, 'name': '💎 Легенда',        'discount': 15},
+]
+
+def get_level_for_spent(spent: float) -> Optional[dict]:
+    """Возвращает последний достигнутый уровень или None"""
+    current = None
+    for lvl in LEVELS:
+        if spent >= lvl['min_spent']:
+            current = lvl
+    return current
+
+def get_next_level(spent: float) -> Optional[dict]:
+    """Возвращает следующий уровень"""
+    for lvl in LEVELS:
+        if spent < lvl['min_spent']:
+            return lvl
+    return None
+
+def generate_promo_code(prefix: str = '') -> str:
+    chars = string.ascii_uppercase + string.digits
+    code = ''.join(random.choices(chars, k=8))
+    return f"{prefix}{code}" if prefix else code
 
 
 class Database:
@@ -11,14 +47,36 @@ class Database:
         async with aiosqlite.connect(self.path) as db:
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS users (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tg_id       INTEGER UNIQUE NOT NULL,
-                    username    TEXT DEFAULT '',
-                    full_name   TEXT DEFAULT '',
-                    ref_code    TEXT UNIQUE,
-                    referred_by INTEGER DEFAULT NULL,
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_id         INTEGER UNIQUE NOT NULL,
+                    username      TEXT DEFAULT '',
+                    full_name     TEXT DEFAULT '',
+                    ref_code      TEXT UNIQUE,
+                    referred_by   INTEGER DEFAULT NULL,
                     bonus_balance REAL DEFAULT 0,
-                    created_at  TEXT DEFAULT (datetime('now', 'localtime'))
+                    total_spent   REAL DEFAULT 0,
+                    current_level INTEGER DEFAULT 0,
+                    created_at    TEXT DEFAULT (datetime('now', 'localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS user_promos (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_id      INTEGER NOT NULL,
+                    code       TEXT UNIQUE NOT NULL,
+                    level      INTEGER NOT NULL,
+                    discount   INTEGER NOT NULL,
+                    used       INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now', 'localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS promo_codes (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code       TEXT UNIQUE NOT NULL,
+                    discount   TEXT NOT NULL,
+                    limit_uses INTEGER DEFAULT -1,
+                    used_count INTEGER DEFAULT 0,
+                    is_active  INTEGER DEFAULT 1,
+                    created_at TEXT DEFAULT (datetime('now', 'localtime'))
                 );
 
                 CREATE TABLE IF NOT EXISTS services (
@@ -96,8 +154,110 @@ class Database:
     # ── USERS ──────────────────────────────────────────────────────────────────
 
     async def upsert_user(self, tg_id, username, full_name, referred_by=None):
-        import random, string
         ref_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO users (tg_id,username,full_name,ref_code,referred_by) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name",
+                (tg_id, username, full_name, ref_code, referred_by)
+            )
+            await db.commit()
+
+    # ── LEVELS ─────────────────────────────────────────────────────────────────
+
+    async def add_spent(self, tg_id: int, amount: float) -> Optional[dict]:
+        """Прибавляет потраченную сумму и возвращает новый уровень если достигнут"""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            # Получаем текущее состояние
+            async with db.execute(
+                "SELECT total_spent, current_level FROM users WHERE tg_id=?", (tg_id,)
+            ) as c:
+                row = await c.fetchone()
+                if not row:
+                    return None
+                old_spent = row['total_spent'] or 0
+                old_level = row['current_level'] or 0
+
+            new_spent = old_spent + amount
+            new_level_data = get_level_for_spent(new_spent)
+            new_level = new_level_data['level'] if new_level_data else 0
+
+            await db.execute(
+                "UPDATE users SET total_spent=?, current_level=? WHERE tg_id=?",
+                (new_spent, new_level, tg_id)
+            )
+            await db.commit()
+
+            # Если достигнут новый уровень — генерируем промокод
+            if new_level > old_level and new_level_data:
+                promo = await self._grant_level_promo(db, tg_id, new_level_data)
+                await db.commit()
+                return {'level': new_level_data, 'promo': promo, 'total_spent': new_spent}
+            return {'level': new_level_data, 'promo': None, 'total_spent': new_spent}
+
+    async def _grant_level_promo(self, db, tg_id: int, level_data: dict) -> str:
+        """Генерирует уникальный промокод для уровня"""
+        prefix = f"LVL{level_data['level']}-"
+        while True:
+            code = generate_promo_code(prefix)
+            try:
+                await db.execute(
+                    "INSERT INTO user_promos (tg_id, code, level, discount) VALUES (?,?,?,?)",
+                    (tg_id, code, level_data['level'], level_data['discount'])
+                )
+                return code
+            except Exception:
+                continue  # Коллизия — генерируем снова
+
+    async def get_user_level_info(self, tg_id: int) -> dict:
+        """Возвращает полную информацию об уровне пользователя"""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT total_spent, current_level FROM users WHERE tg_id=?", (tg_id,)
+            ) as c:
+                row = await c.fetchone()
+                if not row:
+                    return {}
+                spent = row['total_spent'] or 0
+                current = get_level_for_spent(spent)
+                next_lvl = get_next_level(spent)
+                # Промокоды пользователя
+                async with db.execute(
+                    "SELECT * FROM user_promos WHERE tg_id=? ORDER BY level DESC", (tg_id,)
+                ) as pc:
+                    promos = [dict(r) for r in await pc.fetchall()]
+                return {
+                    'total_spent': spent,
+                    'current_level': current,
+                    'next_level': next_lvl,
+                    'promos': promos,
+                    'progress_pct': int((spent / next_lvl['min_spent']) * 100) if next_lvl else 100,
+                }
+
+    async def get_promo_discount(self, code: str, tg_id: int) -> Optional[int]:
+        """Проверяет промокод и возвращает скидку в % или None"""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            # Личный промокод уровня
+            async with db.execute(
+                "SELECT discount FROM user_promos WHERE code=? AND tg_id=? AND used=0",
+                (code, tg_id)
+            ) as c:
+                row = await c.fetchone()
+                if row:
+                    return row['discount']
+            # Общий промокод от админа
+            async with db.execute(
+                "SELECT discount, limit_uses, used_count FROM promo_codes WHERE code=? AND is_active=1",
+                (code,)
+            ) as c:
+                row = await c.fetchone()
+                if row:
+                    if row['limit_uses'] == -1 or row['used_count'] < row['limit_uses']:
+                        return int(row['discount'].replace('%','').replace('₽','')) if '%' in str(row['discount']) else None
+        return None
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 "INSERT INTO users (tg_id,username,full_name,ref_code,referred_by) VALUES (?,?,?,?,?) "
