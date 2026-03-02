@@ -32,6 +32,7 @@ def main_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("🛍 Открыть магазин", web_app=WebAppInfo(url=Config.WEBAPP_URL)))
     kb.add(InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders"))
+    kb.add(InlineKeyboardButton("⭐ Мой уровень", callback_data="my_level"))
     kb.add(InlineKeyboardButton("💬 Поддержка", url=f"https://t.me/{Config.SUPPORT_USERNAME}"))
     return kb
 
@@ -82,8 +83,54 @@ async def cmd_start(message: types.Message):
 
 # ─── /ADMIN ────────────────────────────────────────────────────────────────────
 
-@dp.message_handler(commands=['admin'])
-async def cmd_admin(message: types.Message):
+@dp.message_handler(commands=['level'])
+async def cmd_level(message: types.Message):
+    info = await db.get_user_level_info(message.from_user.id)
+    if not info:
+        await message.answer("Информация не найдена. Напиши /start")
+        return
+
+    current = info.get('current_level')
+    next_lvl = info.get('next_level')
+    spent = info.get('total_spent', 0)
+    promos = info.get('promos', [])
+
+    if current:
+        level_text = f"Твой уровень: <b>{current['name']}</b>"
+    else:
+        level_text = "Уровень: <b>Нет уровня</b>"
+
+    if next_lvl:
+        need = next_lvl['min_spent'] - spent
+        progress = info.get('progress_pct', 0)
+        bar_filled = int(progress / 10)
+        bar = '█' * bar_filled + '░' * (10 - bar_filled)
+        next_text = (
+            f"\n\n📈 До уровня <b>{next_lvl['name']}</b>:\n"
+            f"{bar} {progress}%\n"
+            f"Осталось потратить: <b>{int(need)}₽</b>"
+        )
+    else:
+        next_text = "\n\n🏆 Ты достиг максимального уровня!"
+
+    promos_text = ""
+    if promos:
+        active = [p for p in promos if not p['used']]
+        if active:
+            promos_text = "\n\n🎟 <b>Твои промокоды:</b>\n"
+            for p in active:
+                promos_text += f"• <code>{p['code']}</code> — {p['discount']}% скидка\n"
+
+    await message.answer(
+        f"⭐ <b>Твой прогресс в KeyFlow</b>\n\n"
+        f"💰 Потрачено всего: <b>{int(spent)}₽</b>\n"
+        f"{level_text}"
+        f"{next_text}"
+        f"{promos_text}"
+    )
+
+
+
     logger.info(f"Admin from {message.from_user.id}, ADMIN_IDS={Config.ADMIN_IDS}")
     if message.from_user.id not in Config.ADMIN_IDS:
         await message.answer('Нет доступа. ID: ' + str(message.from_user.id) + ' Need: ' + str(Config.ADMIN_IDS))
@@ -176,6 +223,12 @@ async def process_sbp_paid(message: types.Message, data: dict):
 
 
 # ─── CALLBACKS ─────────────────────────────────────────────────────────────────
+
+@dp.callback_query_handler(lambda c: c.data == 'my_level')
+async def cb_my_level(callback: types.CallbackQuery):
+    await cmd_level(callback.message)
+    await callback.message.delete()
+
 
 @dp.callback_query_handler(lambda c: c.data == 'my_orders')
 async def cb_my_orders(callback: types.CallbackQuery):
@@ -341,6 +394,9 @@ async def adm_delivery_data(message: types.Message, state: FSMContext):
     order = await db.get_order(order_id)
     await db.update_order_status(order_id, 'completed')
 
+    # Начисляем очки за покупку
+    level_result = await db.add_spent(order['user_id'], order['amount'])
+
     try:
         await bot.send_message(
             order['user_id'],
@@ -353,6 +409,22 @@ async def adm_delivery_data(message: types.Message, state: FSMContext):
             f"Поддержка: @{Config.SUPPORT_USERNAME}",
             reply_markup=main_kb()
         )
+
+        # Уведомление о новом уровне
+        if level_result and level_result.get('promo'):
+            lvl = level_result['level']
+            promo = level_result['promo']
+            spent = level_result['total_spent']
+            await bot.send_message(
+                order['user_id'],
+                f"🎊 <b>Новый уровень!</b>\n\n"
+                f"Ты достиг уровня <b>{lvl['name']}</b>!\n"
+                f"Потрачено: <b>{int(spent)}₽</b>\n\n"
+                f"🎟 Твой личный промокод на скидку <b>{lvl['discount']}%</b>:\n"
+                f"<code>{promo}</code>\n\n"
+                f"Используй при следующей покупке — скидка применится автоматически!"
+            )
+
         await message.answer(f"✅ Данные отправлены клиенту — заказ #{order_id} выполнен!")
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить: {e}\n\nДанные: {message.text}")
